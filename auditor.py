@@ -14,40 +14,52 @@ def log_audit(vid_id, verdict, reason=""):
     with open(AUDIT_LOG, "a", encoding="utf-8") as f:
         f.write(f"{datetime.now().isoformat()} | {vid_id} | {verdict} | {reason}\n")
 
-def check_gemini(api_key, text_sample):
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+class OllamaAuditor:
+    """Local LLM Data Integrity Auditor via Ollama."""
     
-    # Forensic-Hardened Prompt
-    prompt = (
-        "SYSTEM ROLE: Data Integrity Auditor for Tamil Speech-to-Text.\n"
-        "TASK: Identify structural 'phonetic loops' or 'hallucination cascades' in Whisper-generated Tamil.\n\n"
-        "INDICATORS OF FAILURE:\n"
-        "1. Extreme repetition of phonemes (e.g., 'இறும் இ இறும் இ' or 'பார் பார் பார்').\n"
-        "2. Nonsensical character gluing (e.g., 'புதனலில்லிலில்லில').\n"
-        "3. Semantic death: 50+ words with no syntactic variation.\n\n"
-        "INSTRUCTIONS: Analyze the text below. If it is a real discourse by an astrologer, reply 'VALID'. "
-        "If it is a hallucinated loop, reply 'HALLUCINATION'. "
-        "Reply ONLY with one of those two words.\n\n"
-        f"TEXT SAMPLE:\n{text_sample}"
-    )
+    def __init__(self, model="qwen2.5:3b", base_url="http://localhost:11434"):
+        self.model = model
+        self.base_url = base_url
     
-    payload = {"contents": [{"parts":[{"text": prompt}]}]}
-    data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(endpoint, data=data, headers={'Content-Type': 'application/json'})
-    
-    try:
-        with urllib.request.urlopen(req) as response:
-            res_json = json.loads(response.read())
-            reply = res_json.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip().upper()
-            return "VALID" if "VALID" in reply else "HALLUCINATION"
-    except Exception as e:
-        return f"API_ERROR: {str(e)}"
+    def check_integrity(self, text_sample):
+        """Analyze text for hallucination loops. Returns 'VALID' or 'HALLUCINATION'."""
+        prompt = (
+            "SYSTEM ROLE: Data Integrity Auditor for Tamil Speech-to-Text.\n"
+            "TASK: Identify structural 'phonetic loops' or 'hallucination cascades' in Whisper-generated Tamil.\n\n"
+            "INDICATORS OF FAILURE:\n"
+            "1. Extreme repetition of phonemes (e.g., 'இறும் இ இறும் இ' or 'பார் பார் பார்').\n"
+            "2. Nonsensical character gluing (e.g., 'புதனலில்லிலில்லில').\n"
+            "3. Semantic death: 50+ words with no syntactic variation.\n\n"
+            "INSTRUCTIONS: Analyze the text below. If it is a real discourse by an astrologer, reply 'VALID'. "
+            "If it is a hallucinated loop, reply 'HALLUCINATION'. "
+            "Reply ONLY with one of those two words.\n\n"
+            f"TEXT SAMPLE:\n{text_sample}"
+        )
+        
+        payload = json.dumps({
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.0}
+        }).encode("utf-8")
+        
+        req = urllib.request.Request(
+            f"{self.base_url}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read())
+                reply = result.get("response", "").strip().upper()
+                return "VALID" if "VALID" in reply else "HALLUCINATION"
+        except Exception as e:
+            return f"ERROR: {str(e)}"
 
 def main():
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("❌ ERROR: GEMINI_API_KEY missing.")
-        return
+    # No API key needed for local Ollama
+    auditor = OllamaAuditor()
         
     if not os.path.exists(REVIEW_DIR):
         print("✅ LOOP_HARVEST is empty. No work for the Oracle.")
@@ -65,7 +77,7 @@ def main():
         sample = " ".join(data.get("full_text", "").split()[:400])
         
         print(f"Auditing {vid_id}... ", end="", flush=True)
-        verdict = check_gemini(api_key, sample)
+        verdict = auditor.check_integrity(sample)
         print(f"[{verdict}]")
         
         log_audit(vid_id, verdict)
