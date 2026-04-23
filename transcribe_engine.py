@@ -45,7 +45,8 @@ Rules:
 2. DO NOT change the meaning or the speaker's core intent.
 3. Correct grammatical errors and ensure the technical astrology terms flow naturally.
 4. If a word is repeated 5+ times consecutively, collapse it to a single instance or remove if it's a hallucination.
-5. Return ONLY the corrected Tamil text. No explanations, no formatting.
+5. If the text is repeating nonsense or consists entirely of a hallucination loop, return ONLY the word [DISCARD].
+6. Return ONLY the corrected Tamil text. No explanations, no formatting.
 
 Raw Transcript:
 {text}"""
@@ -114,6 +115,12 @@ Raw Transcript:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read())
                 corrected = result.get("response", "").strip()
+                
+                # Check for explicit [DISCARD] signal
+                if "[DISCARD]" in corrected:
+                    print("    🛑 [OllamaSentry] LLM signaled [DISCARD] for this transcript.")
+                    return "[DISCARD]"
+                
                 if corrected and len(corrected) > 20:
                     # Reattach any truncated suffix
                     if suffix:

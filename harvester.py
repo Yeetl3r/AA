@@ -105,6 +105,23 @@ def acquire_pipeline_lock():
         print("   If this is wrong, remove /tmp/harvester_pipeline.lock and retry.")
         sys.exit(1)
 
+def is_severe_hallucination(text):
+    """
+    Catches infinite loops that bypass space-delimited UWR checks.
+    Looks for 2-6 character Tamil syllable sequences repeating 5+ times.
+    """
+    if not text:
+        return False
+    # Strips spaces to catch cross-word stutters (e.g. "07 07 07 07 07")
+    compressed_text = text.replace(" ", "")
+    import re
+    if re.search(r'(.{2,6})\1{4,}', compressed_text):
+        return True
+    # Catch massive single-character repeats (e.g. நிநிநிநிநி)
+    if re.search(r'(.)\1{10,}', compressed_text):
+        return True
+    return False
+
 def cleanup_stale_data():
     """Proactively remove incomplete (.tmp) or corrupted JSON files on startup.
     Ensures that interrupted runs start from scratch for those specific videos."""
@@ -236,6 +253,16 @@ def process_single_video(vid_id, url, title, channel_url, video_duration, params
         raw_text = transcribe_res.get('raw_text', '')
         sentry_status = transcribe_res.get('sentry_status', 'UNKNOWN')
         
+        # [INJECTION] HARD REGEX SENTRY
+        # If the raw Whisper output is hallucinating, force failure BEFORE the LLM or Validator sees it.
+        if is_severe_hallucination(raw_text):
+            print("    🛑 [Regex Sentry] Caught catastrophic syllable loop. Forcing retry...")
+            # We overwrite the validator inputs to guarantee a failure
+            category = "HALLUCINATION_LOOP"
+            metrics = {"error": "Caught by Hard Regex Sentry"}
+            # Continue the loop to force the pass_idx retry
+            continue
+            
         # Apply word-level deduplication to segments for backward compatibility
         for seg in segments:
             seg['text'] = transcribe_engine.denoise_loops(seg.get('text', ''))
