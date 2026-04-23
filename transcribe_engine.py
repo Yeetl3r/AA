@@ -128,7 +128,6 @@ _sentry = OllamaSentry()
 
 
 LOCAL_MODEL_PATH = "/Volumes/Storage Drive/AA/mlx_models/large-v3"
-TAMIL_MEDIUM_PATH = "/Volumes/Storage Drive/AA/model_tamil_medium"
 GOLDEN_GLOSSARY = "சுபத்துவ பரிவர்த்தனை, லக்னம், திசை, புத்தி, நவாம்சம், ராகு தோஷம், சுக்கிரன், குரு, சனி, கேது"
 
 # --- DENOISE ---
@@ -478,6 +477,29 @@ def get_dynamic_prompt(title, fallback_glossary=""):
         
     return ", ".join(list(set(matched_terms))[:30]) # Cap at 30 terms for reliability
 
+def _validate_model_config(model_path):
+    """Phase 3: Validate that the model is the expected 4-bit quantized version.
+    Returns (True, "msg") if valid, (False, "msg") otherwise.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(config_path):
+        return False, f"config.json not found at {model_path}"
+    
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        
+        # Check for 4-bit quantization
+        quant = config.get("quantization", {})
+        bits = quant.get("bits", 0)
+        
+        if bits == 4:
+            return True, f"Verified 4-bit quantized large-v3 ({config.get('n_text_layer', '??')} layers)"
+        else:
+            return False, f"Invalid quantization: expected 4 bits, found {bits}"
+    except Exception as e:
+        return False, f"Failed to parse config: {e}"
+
 def transcribe_audio(audio_np, params=None):
     """Run mlx-whisper on a pre-processed numpy audio array.
     
@@ -551,8 +573,8 @@ def transcribe_video(url, video_id, params=None):
     Concatenates VAD speech chunks into a single audio buffer and transcribes 
     in one pass to avoid redundant encoder overhead per-chunk.
     
-    Phase 3: If UWR < 0.3 on large-v3 output, automatically retries with 
-    Tamil-medium model as a domain-specific fallback.
+    Phase 3: Validates the quantized large-v3 model configuration for 
+    optimal 4-bit performance on M4 hardware.
     
     params dict can include all transcribe_audio params plus:
       - use_vad (bool, default True)
@@ -610,33 +632,18 @@ def transcribe_video(url, video_id, params=None):
         
         merged_audio = np.concatenate(merged_audio_parts) if merged_audio_parts else audio
         
+        # Phase 3: Validate quantized large-v3 config
+        is_valid, v_msg = _validate_model_config(LOCAL_MODEL_PATH)
+        if not is_valid:
+            print(f"    [Phase 3 ERROR] Config Validation Failed: {v_msg}")
+            # We continue but warn, as the model might still load but performance/accuracy might differ
+        else:
+            print(f"    [Phase 3] {v_msg}")
+        
         # Single-pass transcription on merged audio (one encoder pass instead of N)
         result = transcribe_audio(merged_audio, params)
         raw_text = result.get('text', '').strip()
-        
-        # Phase 3: Tamil-Medium Fallback on low UWR
-        model_used = params.get("model_path", LOCAL_MODEL_PATH)
         uwr = _compute_uwr(raw_text) if raw_text else 0.0
-        
-        if raw_text and uwr < 0.3 and model_used == LOCAL_MODEL_PATH:
-            # large-v3 produced heavily repetitive output — try Tamil-medium
-            if os.path.isdir(TAMIL_MEDIUM_PATH):
-                print(f"    [Fallback] UWR={uwr:.2f} < 0.3 — retrying with Tamil-medium model...")
-                fallback_params = dict(params)
-                fallback_params["model_path"] = TAMIL_MEDIUM_PATH
-                result_fallback = transcribe_audio(merged_audio, fallback_params)
-                fallback_text = result_fallback.get('text', '').strip()
-                fallback_uwr = _compute_uwr(fallback_text) if fallback_text else 0.0
-                
-                if fallback_text and fallback_uwr > uwr:
-                    print(f"    [Fallback] Tamil-medium UWR={fallback_uwr:.2f} > {uwr:.2f}. Using fallback.")
-                    result = result_fallback
-                    raw_text = fallback_text
-                    model_used = TAMIL_MEDIUM_PATH
-                else:
-                    print(f"    [Fallback] Tamil-medium didn't improve (UWR={fallback_uwr:.2f}). Keeping large-v3.")
-            else:
-                print(f"    [Fallback] Tamil-medium model not found at {TAMIL_MEDIUM_PATH}. Skipping.")
         
         # Re-map segment timestamps back to original audio timeline
         all_segments = []
@@ -664,7 +671,7 @@ def transcribe_video(url, video_id, params=None):
             'text': corrected_text if corrected_text else raw_text,
             'raw_text': raw_text, # Keep raw for debugging/resumability
             'segments': all_segments,
-            'model_used': os.path.basename(model_used),
+            'model_used': os.path.basename(LOCAL_MODEL_PATH),
             'uwr': round(uwr, 3),
             'sentry_status': "CORRECTED" if corrected_text and corrected_text != raw_text else "RAW_ONLY"
         }

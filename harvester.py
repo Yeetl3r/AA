@@ -105,6 +105,40 @@ def acquire_pipeline_lock():
         print("   If this is wrong, remove /tmp/harvester_pipeline.lock and retry.")
         sys.exit(1)
 
+def cleanup_stale_data():
+    """Proactively remove incomplete (.tmp) or corrupted JSON files on startup.
+    Ensures that interrupted runs start from scratch for those specific videos."""
+    raw_dir = os.path.join(OUTPUT_FOLDER, "raw_queue")
+    if not os.path.exists(raw_dir):
+        return
+    
+    removed_count = 0
+    for f in os.listdir(raw_dir):
+        path = os.path.join(raw_dir, f)
+        # 1. Always delete .tmp files
+        if f.endswith(".tmp"):
+            try:
+                os.remove(path)
+                removed_count += 1
+            except: pass
+        # 2. Delete empty or corrupted .json files
+        elif f.endswith(".json"):
+            try:
+                if os.path.getsize(path) == 0:
+                    os.remove(path)
+                    removed_count += 1
+                    continue
+                with open(path, 'r') as jf:
+                    json.load(jf)
+            except (json.JSONDecodeError, OSError):
+                try:
+                    os.remove(path)
+                    removed_count += 1
+                except: pass
+    
+    if removed_count > 0:
+        print(f"  🧹 Startup Cleanup: Removed {removed_count} incomplete/stale files.")
+
 def verify_model_architecture():
     config_path = os.path.join(LOCAL_MODEL_PATH, "config.json")
     if os.path.exists(config_path):
@@ -295,6 +329,9 @@ def main():
     
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
+    
+    # Proactively clean up incomplete files from previous interrupted runs
+    cleanup_stale_data()
         
     # Start Heartbeat Thread
     heartbeat_thread = threading.Thread(target=ssd_pulse, daemon=True)
