@@ -1,0 +1,24 @@
+# Secrets & Config
+config_keys.py
+
+# Environments
+venv/
+venv_314/
+venv_safe/
+
+# Large Data & Models
+hf_cache/
+mlx_models/
+model_brain/
+model_indic/
+model_indic_ct2/
+model_tamil_medium/
+model_turbo*
+astrologer_data_hybrid/
+mlx-examples/
+
+# System & Logs
+.DS_Store
+__pycache__/
+*.log
+*.tmp

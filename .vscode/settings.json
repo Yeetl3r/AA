@@ -1,0 +1,7 @@
+{
+    "python.defaultInterpreterPath": "/Volumes/Storage Drive/AA/venv_314/bin/python",
+    "python.analysis.extraPaths": [],
+    "python.languageServer": "Pylance",
+    "python.analysis.typeCheckingMode": "basic",
+    "terminal.integrated.defaultProfile.osx": "zsh"
+}
