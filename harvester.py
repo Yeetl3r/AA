@@ -70,24 +70,25 @@ def get_thermal_level():
     return 0
 
 def cooldown_if_needed():
-    """Reactive thermal cooldown: only sleeps when needed, re-checks after each sleep.
-    Uses exponential backoff (30s → 60s → 120s → 240s) instead of a flat 180s."""
+    """Reactive thermal cooldown tuned for fanless M4 Air.
+    Triggers at MODERATE (level 1) since there's no fan for active recovery.
+    Uses exponential backoff (20s → 40s → 80s → 160s) with shorter intervals."""
     def log_thermal(level, duration):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         msg = f"[THERMAL GUARD] | {timestamp} | Level: {level} | Sleeping for {duration}s\n"
         with open(HEARTBEAT_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(msg)
 
-    backoff = 30
+    backoff = 20
     while True:
         level = get_thermal_level()
-        if level < 2:  # Only react to HEAVY (2) or CRITICAL (3) pressure
+        if level < 1:  # React to MODERATE (1), HEAVY (2), CRITICAL (3) — fanless M4 Air
             return
-        sleep_time = min(backoff, 240)
+        sleep_time = min(backoff, 160)
         print(f"  🚨 Thermal Level {level}. Cooling down {sleep_time}s...")
         log_thermal(level, sleep_time)
         time.sleep(sleep_time)
-        backoff *= 2  # Exponential backoff: 30 → 60 → 120 → 240
+        backoff *= 2  # Exponential backoff: 20 → 40 → 80 → 160
 
 
 def acquire_pipeline_lock():
@@ -387,10 +388,11 @@ def main():
                 print(f"  ETA: {eta} | Transcribing...", end="", flush=True)
 
                 params = {
-                    "condition_on_previous_text": True, 
-                    "no_speech_threshold": 0.8, 
+                    "condition_on_previous_text": False, 
+                    "no_speech_threshold": 0.6, 
                     "use_vad": True,
                     "title": title,
+                    "video_id": vid_id,
                     "model_path": LOCAL_MODEL_PATH
                 }
                 
@@ -406,7 +408,7 @@ def main():
                 if processed_files_count % 50 == 0:
                     level = get_thermal_level()
                     if level >= 1:
-                        flush_time = 60 if level == 1 else 180
+                        flush_time = 45 if level == 1 else 120
                         print(f"\n  ❄️ [Endurance Sweep] 50 videos done. Thermal level {level}, cooling {flush_time}s...")
                         mx.metal.clear_cache()
                         gc.collect()
@@ -447,10 +449,11 @@ def main():
             print(f"  ETA: {eta} | Transcribing...", end="", flush=True)
             
             params = {
-                "condition_on_previous_text": True, 
-                "no_speech_threshold": 0.8, 
+                "condition_on_previous_text": False, 
+                "no_speech_threshold": 0.6, 
                 "use_vad": True, 
                 "title": title,
+                "video_id": vid_id,
                 "model_path": LOCAL_MODEL_PATH
             }
             
