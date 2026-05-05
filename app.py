@@ -135,7 +135,7 @@ with st.sidebar:
     st.markdown("---")
     
     st.subheader("Config")
-    llm_model = st.selectbox("LLM Brain", ["qwen2.5:7b", "qwen2.5:14b", "llama3.1:8b"], index=0)
+    llm_model = st.selectbox("LLM Brain", ["qwen2.5:14b", "qwen2.5:7b", "llama3.1:8b"], index=0)
     
     st.markdown("---")
     st.subheader("Knowledge Stats")
@@ -215,7 +215,8 @@ if prompt := st.chat_input("கேள்வி கேளுங்கள்... (e
                     ],
                     "stream": True,
                     "options": {
-                        "temperature": 0.3,
+                        "temperature": 0.1,      # Lowered for strict RAG accuracy
+                        "repeat_penalty": 1.2,   # Added to kill the repetition loop
                         "num_ctx": 8192
                     }
                 }

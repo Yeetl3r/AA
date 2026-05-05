@@ -42,11 +42,10 @@ from typing import Optional
 BASE_DIR       = "/Volumes/Storage Drive/AA"
 DATA_SOURCE    = os.path.join(BASE_DIR, "astrologer_data_hybrid", "cleaned")
 INDEX_DIR      = os.path.join(BASE_DIR, "astrologer_data_hybrid", "knowledge_index")
-INDEX_DIR      = os.path.join(BASE_DIR, "astrologer_data_hybrid", "knowledge_index")
 
 OLLAMA_BASE    = "http://localhost:11434"
 EMBED_MODEL    = "nomic-embed-text"
-DEFAULT_LLM    = "qwen2.5:7b"
+DEFAULT_LLM    = "qwen2.5:14b"  # Upgraded to 14B for better reasoning and synthesis
 
 # RAG parameters (tuned for Tamil astrology)
 TOP_K           = 8      # segments to retrieve per query
@@ -57,15 +56,15 @@ CHUNK_WORDS     = 60     # target words per indexed chunk
 TAMIL_RANGE = (0x0B80, 0x0BFF)
 
 # ── SYSTEM PROMPT ──────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are a Tamil astrology expert. Answer ONLY using the text provided below.
+SYSTEM_PROMPT = """You are a highly capable Tamil astrology expert. You will receive context text in Tamil and a user query.
 
-Strict rules:
-1. Always answer in Tamil, even if the question is in English.
-2. Use facts from the provided text. If the text is partially relevant, provide the best possible answer based on it.
-3. If the answer is absolutely not in the provided text, respond exactly: "இந்த தகவல் என்னிடம் இல்லை"
-4. Keep answers concise and clear. Do NOT generate follow-up questions.
-5. Do NOT repeat the question or add any preamble before your answer.
-6. Use correct astrological Tamil terminology."""
+Strict instructions:
+1. Comprehension: Read the provided Tamil context carefully.
+2. Grounding: Answer the user's question ONLY using the facts from the provided text.
+3. Language: ALWAYS answer in Tamil, regardless of the language the user used to ask the question.
+4. Fallback: If the provided text does not contain the answer, you must respond EXACTLY with: "இந்த தகவல் என்னிடம் இல்லை". Do not attempt to guess, hallucinate, or apologize.
+5. Formatting: Keep your answer direct, concise, and grammatically correct.
+6. Generation Rules: Do NOT repeat the prompt, do NOT add filler phrases, and do NOT repeat sentences in a loop."""
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -419,10 +418,10 @@ def ask_llm(query, context, llm_model=DEFAULT_LLM):
         ],
         "stream":      True,
         "options": {
-            "temperature":    0.3,
+            "temperature":    0.1,    # Lowered from 0.3 to enforce strict factual responses
             "num_predict":    350,
             "num_ctx":        6144,
-            "repeat_penalty": 1.1,
+            "repeat_penalty": 1.2,    # Increased to stop the stuttering/repetition loop
         }
     }
 
