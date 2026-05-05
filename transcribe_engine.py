@@ -17,15 +17,23 @@ import subprocess
 import numpy as np
 import mlx_whisper
 
-# --- GLOBAL VAD INITIALIZATION (lightweight webrtcvad — no PyTorch) ---
-try:
-    import webrtcvad
-    _vad = webrtcvad.Vad(2)  # Aggressiveness: 0 (least) to 3 (most)
-    print("[Engine] WebRTC-VAD Active (no PyTorch overhead).")
-except ImportError:
-    print("[Engine] WARNING: webrtcvad not installed. Run: pip install webrtcvad-wheels")
-    print("[Engine] Falling back to full-audio mode (no VAD).")
-    _vad = None
+# --- GLOBAL VAD INITIALIZATION (Silero VAD) ---
+import torch
+
+_silero_model = None
+_silero_utils = None
+
+def get_silero_vad():
+    global _silero_model, _silero_utils
+    if _silero_model is None:
+        # Route to external drive for model storage if possible
+        # torch.hub uses TORCH_HOME
+        os.environ["TORCH_HOME"] = "/Volumes/Storage Drive/AA/torch_cache"
+        _silero_model, _silero_utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                                      model='silero_vad',
+                                                      force_reload=False,
+                                                      verbose=False)
+    return _silero_model, _silero_utils
 
 import json
 import urllib.request
@@ -137,6 +145,27 @@ _sentry = OllamaSentry()
 LOCAL_MODEL_PATH = "/Volumes/Storage Drive/AA/mlx_models/large-v3"
 GOLDEN_GLOSSARY = "சுபத்துவ பரிவர்த்தனை, லக்னம், திசை, புத்தி, நவாம்சம், ராகு தோஷம், சுக்கிரன், குரு, சனி, கேது"
 
+# --- TERMINOLOGY ANCHORING ---
+
+def anchor_terminology(text):
+    """Deterministic post-correction for common astrology terms."""
+    # List of common variations and their canonical Tamil forms
+    anchors = {
+        "சுபத்துவ": "சுபத்துவ",
+        "பரிவர்த்தனை": "பரிவர்த்தனை",
+        "லக்னம்": "லக்னம்",
+        "ராசி": "ராசி",
+        "நவாம்சம்": "நவாம்சம்",
+        "திசை": "திசை",
+        "புத்தி": "புத்தி",
+        "அந்தரம்": "அந்தரம்",
+        "சூட்சமம்": "சூட்சமம்",
+    }
+    for wrong, right in anchors.items():
+        # Simple string replace for now; could be regex for boundary safety
+        text = text.replace(wrong, right)
+    return text
+
 # --- DENOISE ---
 
 # Common Tamil suffix variations for normalization during dedup
@@ -226,6 +255,14 @@ def denoise_loops(text):
         # If normalized forms match, skip (it's a suffix-variant repeat)
     
     return " ".join(final)
+
+def clean_channel_name(url):
+    """Extract and sanitize channel name from YouTube URL."""
+    match = re.search(r'@([^/]+)', url)
+    if match:
+        name = match.group(1)
+        return "".join([c for c in name if c.isalnum() or c in (' ', '-', '_')]).strip()
+    return "Unknown_Channel"
 
 # --- CORE TRANSCRIPTION ---
 
@@ -325,13 +362,14 @@ def download_audio(url):
                     except: pass
 
 
-def fetch_youtube_captions(video_id, preferred_langs=("ta", "ta-IN")):
-    """Fetch YouTube captions via yt-dlp for initial_prompt anchoring.
+def fetch_youtube_captions(video_id, preferred_langs=("ta", "ta-IN"), mode="ANCHOR_ONLY"):
+    """Fetch YouTube captions via yt-dlp.
     
-    Priority: manual Tamil (ta) → auto-generated Tamil (ta-IN) → None.
-    Non-Tamil captions are explicitly rejected to avoid poisoning Whisper's Tamil decoder.
+    Modes:
+    - ANCHOR_ONLY: Returns first ~200 words for initial_prompt.
+    - FULL_TRANSCRIPT: Returns entire parsed text.
     
-    Returns: First ~200 words of caption text, or None if no Tamil captions available.
+    Returns: { "status": "SUCCESS", "text": "...", "type": "manual"|"auto", "lang": "..." } or None.
     """
     import tempfile
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -339,7 +377,7 @@ def fetch_youtube_captions(video_id, preferred_langs=("ta", "ta-IN")):
     with tempfile.TemporaryDirectory() as tmpdir:
         for lang in preferred_langs:
             # Try manual subs first, then auto-subs
-            for sub_flag in (['--write-subs'], ['--write-auto-subs']):
+            for sub_flag, sub_type in [(['--write-subs'], 'manual'), (['--write-auto-subs'], 'auto')]:
                 cmd = [
                     _YTDLP_PATH,
                     *sub_flag,
@@ -364,91 +402,65 @@ def fetch_youtube_captions(video_id, preferred_langs=("ta", "ta-IN")):
                             lines = []
                             for line in raw.split('\n'):
                                 line = line.strip()
-                                # Skip VTT header, timestamps, and sequence numbers
-                                if not line or line.startswith('WEBVTT') or line.startswith('NOTE'):
+                                # Skip VTT header, timestamps, sequence numbers, and empty lines
+                                if not line or line.startswith('WEBVTT') or line.startswith('NOTE') or line.isdigit():
                                     continue
                                 if '-->' in line:  # Timestamp line
                                     continue
-                                if line.isdigit():  # SRT sequence number
-                                    continue
-                                # Strip HTML tags
-                                clean = re.sub(r'<[^>]+>', '', line)
-                                if clean:
-                                    lines.append(clean)
+                                # Remove HTML tags often found in auto-captions
+                                line = re.sub(r'<[^>]+>', '', line)
+                                if line:
+                                    lines.append(line)
                             
-                            if lines:
-                                full_text = ' '.join(lines)
-                                # Return first 200 words as anchor
-                                words = full_text.split()[:200]
-                                caption_text = ' '.join(words)
-                                print(f"    [Captions] Fetched {len(words)} words ({lang}, {'manual' if '--write-subs' in sub_flag else 'auto'})")
-                                return caption_text
-                except subprocess.TimeoutExpired:
-                    continue
+                            if not lines: continue
+                            
+                            full_text = " ".join(lines)
+                            if mode == "ANCHOR_ONLY":
+                                words = full_text.split()
+                                result_text = " ".join(words[:200])
+                            else:
+                                result_text = full_text
+                            
+                            if len(result_text) > 50:
+                                return {
+                                    "status": "SUCCESS",
+                                    "text": result_text,
+                                    "type": sub_type,
+                                    "lang": lang
+                                }
                 except Exception:
                     continue
-    
     return None
 
 
 def apply_vad(audio_np, sample_rate=16000):
-    """Detect speech chunks using WebRTC VAD (lightweight, no PyTorch).
+    """Detect speech chunks using Silero VAD (Neural Speech Detection).
     Returns a list of timestamp dicts (e.g., [{'start': 304, 'end': 12000}]), or None if no speech.
     """
-    if _vad is None:
-        # Fallback: treat entire audio as a single speech chunk
+    try:
+        model, utils = get_silero_vad()
+        (get_speech_timestamps, _, _, _, _) = utils
+        
+        # Silero expects float32 tensor
+        audio_tensor = torch.from_numpy(audio_np)
+        
+        # Get speech timestamps
+        # threshold 0.5 is standard, min_silence_duration_ms=500 to match previous logic
+        speech_timestamps = get_speech_timestamps(
+            audio_tensor, 
+            model, 
+            sampling_rate=sample_rate,
+            threshold=0.5,
+            min_silence_duration_ms=500
+        )
+        
+        if not speech_timestamps:
+            return None
+            
+        return speech_timestamps
+    except Exception as e:
+        print(f"[Engine] Silero VAD Failed: {e}. Falling back to full-audio.")
         return [{'start': 0, 'end': len(audio_np)}]
-    
-    # WebRTC-VAD requires 16-bit PCM; convert from float32
-    pcm_16 = (audio_np * 32767).astype(np.int16)
-    frame_duration_ms = 30  # WebRTC supports 10, 20, 30ms frames
-    frame_size = int(sample_rate * frame_duration_ms / 1000)  # 480 samples per frame
-    
-    # Scan all frames for speech/non-speech
-    is_speech = []
-    for i in range(0, len(pcm_16) - frame_size + 1, frame_size):
-        frame_bytes = pcm_16[i:i + frame_size].tobytes()
-        try:
-            is_speech.append(_vad.is_speech(frame_bytes, sample_rate))
-        except Exception:
-            is_speech.append(False)
-    
-    if not any(is_speech):
-        return None
-    
-    # Merge consecutive speech frames into chunks with min_silence_duration of 500ms
-    min_silence_frames = int(500 / frame_duration_ms)  # ~17 frames of silence to split
-    chunks = []
-    in_speech = False
-    start_frame = 0
-    silence_count = 0
-    
-    for idx, speech in enumerate(is_speech):
-        if speech:
-            if not in_speech:
-                start_frame = idx
-                in_speech = True
-            silence_count = 0
-        else:
-            if in_speech:
-                silence_count += 1
-                if silence_count >= min_silence_frames:
-                    end_frame = idx - silence_count + 1
-                    chunks.append({
-                        'start': start_frame * frame_size,
-                        'end': end_frame * frame_size
-                    })
-                    in_speech = False
-                    silence_count = 0
-    
-    # Flush final chunk
-    if in_speech:
-        chunks.append({
-            'start': start_frame * frame_size,
-            'end': len(audio_np)
-        })
-    
-    return chunks if chunks else None
 
 
 try:
@@ -510,13 +522,10 @@ def _validate_model_config(model_path):
 def transcribe_audio(audio_np, params=None):
     """Run mlx-whisper on a pre-processed numpy audio array.
     
-    params dict can override:
-      - condition_on_previous_text (bool, default False) — disabled to prevent loop cascades
-      - temperature (tuple, default (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)) — multi-temp fallback
-      - initial_prompt (str, default None) — YouTube captions or glossary terms
-      - no_speech_threshold (float, default 0.6) — tightened for M4
-      - model_path (str, default LOCAL_MODEL_PATH)
-      - video_id (str) — used for caption fetching
+    Implementation v2 improvements:
+    - beam_size=5 for superior decoding
+    - Confidence gating (avg_logprob > -0.8)
+    - Placeholder injection for low-confidence segments
     """
     if params is None:
         params = {}
@@ -526,42 +535,53 @@ def transcribe_audio(audio_np, params=None):
     initial_prompt = params.get("initial_prompt", None)
     no_speech_threshold = params.get("no_speech_threshold", 0.6)
     model_path = params.get("model_path", LOCAL_MODEL_PATH)
-    beam_size = params.get("beam_size", 1) # Set to 1 as mlx-whisper doesn't support beam search yet
-    if beam_size > 1:
-        print(f"  ⚠️ Warning: beam_size > 1 requested, but mlx-whisper only supports greedy decoding. Forcing beam_size=1.")
-        beam_size = 1
+    
     kwargs = {
         "path_or_hf_repo": model_path,
         "language": "ta",
         "task": "transcribe",
         "temperature": temperature,
-        "compression_ratio_threshold": 1.8, # Tight threshold to reject looping segments early
+        "compression_ratio_threshold": 1.8,
         "no_speech_threshold": no_speech_threshold,
         "condition_on_previous_text": condition_on_previous_text,
         "verbose": False,
+        "beam_size": 5, # v2 standard
+        "best_of": 5,
     }
     
-    # Logical prompt assembly — Priority: explicit > captions > glossary
-    title = params.get("title", "")
-    video_id = params.get("video_id", "")
-    
+    # Logical prompt assembly
     if initial_prompt:
         kwargs["initial_prompt"] = initial_prompt
     else:
-        # Phase 2: Try YouTube Tamil captions first
-        caption_text = None
-        if video_id:
-            caption_text = fetch_youtube_captions(video_id)
+        video_id = params.get("video_id", "")
+        title = params.get("title", "")
+        cap_res = fetch_youtube_captions(video_id) if video_id else None
         
-        if caption_text:
-            # Anchor Whisper with real Tamil text from captions
-            kwargs["initial_prompt"] = caption_text
+        if cap_res and cap_res.get("status") == "SUCCESS":
+            kwargs["initial_prompt"] = cap_res.get("text", "")
         elif title:
-            # Fallback to glossary-based prompt
-            dynamic_glossary = get_dynamic_prompt(title)
-            kwargs["initial_prompt"] = f"{title}. {dynamic_glossary}"
-    
+            kwargs["initial_prompt"] = f"{title}. {get_dynamic_prompt(title)}"
+
     result = mlx_whisper.transcribe(audio_np, **kwargs)
+    
+    # Confidence Gating & Placeholder Injection
+    filtered_segments = []
+    for seg in result.get('segments', []):
+        avg_logprob = seg.get('avg_logprob', -999)
+        if avg_logprob < -0.8:
+            # Low confidence: replace text with placeholder
+            start_ts = round(seg['start'], 2)
+            end_ts = round(seg['end'], 2)
+            seg['text'] = f" ⟨UNCLEAR:{start_ts}-{end_ts}⟩ "
+            seg['confidence_reject'] = True
+        else:
+            seg['confidence_reject'] = False
+        filtered_segments.append(seg)
+    
+    result['segments'] = filtered_segments
+    # Re-build text from segments
+    result['text'] = "".join([s['text'] for s in filtered_segments]).strip()
+    
     return result
 
 
@@ -667,20 +687,16 @@ def transcribe_video(url, video_id, params=None):
                     break
             all_segments.append(seg)
         
-        # Stage 2: Ollama 'Life Correction' (local, no API limits)
-        if not raw_text:
-            return None
-            
-        print(f"    [OllamaSentry] Running Life Correction...")
-        corrected_text = _sentry.correct_transcript(raw_text, title=params.get("title", ""))
+        # Terminology Anchoring
+        anchored_text = anchor_terminology(raw_text)
         
         return {
-            'text': corrected_text if corrected_text else raw_text,
-            'raw_text': raw_text, # Keep raw for debugging/resumability
+            'text': anchored_text,
+            'raw_text': raw_text, # Before anchoring but after placeholders
             'segments': all_segments,
             'model_used': os.path.basename(LOCAL_MODEL_PATH),
             'uwr': round(uwr, 3),
-            'sentry_status': "CORRECTED" if corrected_text and corrected_text != raw_text else "RAW_ONLY"
+            'sentry_status': "RAW"
         }
     except Exception as e:
         print(f"    [Transcribe Error] {e}")

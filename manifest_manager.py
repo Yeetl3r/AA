@@ -16,7 +16,7 @@ class ManifestManager:
         return open(self.path, 'a+' if mode == 'w' else 'r')
 
     def update_entry(self, video_id, data):
-        """Add or update a video entry in the manifest atomically."""
+        """Add or update a video entry in the manifest atomically. Supports partial updates."""
         lock_fd = open(self.path, 'a+')
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -26,16 +26,23 @@ class ManifestManager:
             content = lock_fd.read()
             manifest = json.loads(content) if content else {}
             
-            # Update
-            manifest[video_id] = {
-                "timestamp": time.time(),
-                "filepath": data.get("filepath", ""),
-                "title": data.get("title", "Unknown"),
-                "category": data.get("category", "UNKNOWN"),
-                "duration": data.get("duration", 0),
-                "in_escrow": data.get("in_escrow", False),
-                "sentry_status": data.get("sentry_status", "UNKNOWN")
-            }
+            # Get existing entry or create new
+            existing = manifest.get(video_id, {
+                "title": "Unknown",
+                "category": "PENDING",
+                "duration": 0,
+                "in_escrow": False,
+                "sentry_status": "PENDING",
+                "filepath": ""
+            })
+            
+            # Update fields
+            existing["timestamp"] = time.time()
+            for key in ["filepath", "title", "category", "duration", "in_escrow", "sentry_status"]:
+                if key in data:
+                    existing[key] = data[key]
+            
+            manifest[video_id] = existing
             
             # Write back
             lock_fd.seek(0)
@@ -47,6 +54,11 @@ class ManifestManager:
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
+
+    def get_entry(self, video_id):
+        """Retrieve a specific entry from the manifest safely."""
+        manifest = self.get_manifest()
+        return manifest.get(video_id)
 
     def get_manifest(self):
         """Read the full manifest safely."""

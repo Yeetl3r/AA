@@ -46,6 +46,8 @@ HEARTBEAT_LOG_FILE = "heartbeat.log"
 LOCAL_MODEL_PATH = "/Volumes/Storage Drive/AA/mlx_models/large-v3"
 MAX_VIDEOS_PER_TAB = None 
 LOCK_FILE = "/tmp/harvester_pipeline.lock"
+CORRECTION_QUEUE = os.path.join(OUTPUT_FOLDER, "correction_queue")
+os.makedirs(CORRECTION_QUEUE, exist_ok=True)
 
 # --- ROBUSTNESS FUNCTIONS ---
 
@@ -217,128 +219,70 @@ def safe_filename(title, video_id, channel_url):
 
 # [Moved denoise_loops and get_whisper_transcription to transcribe_engine.py]
 
-# --- MAIN LOOP ---
-
-# --- SHARED VIDEO PROCESSING ---
-
 def process_single_video(vid_id, url, title, channel_url, video_duration, params, manifest_mgr):
-    """Unified video processing: transcribe → denoise → quality check → write JSON + JSONL.
-    Returns True on success, False on failure, None on skip (MEMBERS_ONLY)."""
+    """Transcription-only pass: download -> transcribe -> write to correction queue."""
     
-    # --- TRANSCRIPTION PASS (v2.2 Self-Correcting) ---
-    max_passes = 2
-    for pass_idx in range(max_passes):
-        vid_start = time.time()
+    vid_start = time.time()
+    transcribe_res = transcribe_engine.transcribe_video(url, vid_id, params)
+    processing_time = time.time() - vid_start
+    
+    if not transcribe_res:
+        print(" -> ⚠️ FAILED (No result).")
+        return False
+    if transcribe_res == "MEMBERS_ONLY":
+        return None
         
-        # Adjust params for retry pass if we detected a failure previously
-        current_params = params.copy()
-        if pass_idx > 0:
-            print(f"    [Retry Pass] Attempting loop-breaking configuration (temp=0.2, no-condition)...")
-            current_params["temperature"] = (0.2,)
-            current_params["condition_on_previous_text"] = False
-            
-        transcribe_res = transcribe_engine.transcribe_video(url, vid_id, current_params)
-        processing_time = time.time() - vid_start
-        
-        if not transcribe_res:
-            print(" -> ⚠️ FAILED (No result).")
-            return False
-        if transcribe_res == "MEMBERS_ONLY":
-            return None
-            
-        # --- EXTRACT RESULTS (v2.3 Omega-Repair aware) ---
-        segments = transcribe_res.get('segments', [])
-        # The engine now returns 'text' (corrected) and 'raw_text' (ASR direct output)
-        final_text = transcribe_res.get('text', '')
-        raw_text = transcribe_res.get('raw_text', '')
-        sentry_status = transcribe_res.get('sentry_status', 'UNKNOWN')
-        
-        # [INJECTION] HARD REGEX SENTRY
-        # If the raw Whisper output is hallucinating, force failure BEFORE the LLM or Validator sees it.
-        if is_severe_hallucination(raw_text):
-            print("    🛑 [Regex Sentry] Caught catastrophic syllable loop. Forcing retry...")
-            # We overwrite the validator inputs to guarantee a failure
-            category = "HALLUCINATION_LOOP"
-            metrics = {"error": "Caught by Hard Regex Sentry"}
-            # Continue the loop to force the pass_idx retry
-            continue
-            
-        # Apply word-level deduplication to segments for backward compatibility
-        for seg in segments:
-            seg['text'] = transcribe_engine.denoise_loops(seg.get('text', ''))
-        
-        # --- IN-LINE AUDIT (The "Quality Gate") ---
-        data_to_audit = {
-            "metadata": {"title": title, "video_id": vid_id},
-            "full_text": final_text,
-            "raw_text": raw_text,
-            "sentry_status": sentry_status,
-            "segments": segments
-        }
-        category, metrics = validator_v2.validate_transcription(data_to_audit)
-        
-        if category == "SUCCESS" or pass_idx == max_passes - 1:
-            if category != "SUCCESS":
-                print(f" -> ⚠️ Final Category: {category} (Retry failed to resolve completely).")
-            break
-        else:
-            print(f" -> 🔄 Audit FAILURE: {category}. Triggering in-line retry...")
-
+    # --- EXTRACT RESULTS ---
+    segments = transcribe_res.get('segments', [])
+    final_text = transcribe_res.get('text', '')
+    raw_text = transcribe_res.get('raw_text', '')
+    sentry_status = transcribe_res.get('sentry_status', 'RAW')
+    
     rtf_str = ""
     if processing_time > 0 and video_duration:
         rtf = video_duration / processing_time
         rtf_str = f"RTF: {rtf:.2f}x"
 
-    # --- WRITE OUTPUT ---
+    # --- PREPARE DATA FOR CORRECTION WORKER ---
     data = {
         "metadata": {
             "video_id": vid_id, 
             "title": title, 
             "channel": channel_url,
             "duration": video_duration,
-            "timestamp": datetime.datetime.now().isoformat()
+            "timestamp": datetime.datetime.now().isoformat(),
+            "rtf": rtf_str,
+            "processing_time": processing_time
         }, 
         "full_text": final_text,
         "raw_text": raw_text,
         "sentry_status": sentry_status,
         "segments": segments,
-        "audit": {
-            "category": category,
-            "metrics": metrics
-        }
+        "model_used": transcribe_res.get('model_used', 'unknown')
     }
     
-    final_path = safe_filename(title, vid_id, channel_url)
-    target_dir = os.path.dirname(final_path)
-    os.makedirs(target_dir, exist_ok=True)
-    temp_path = final_path + ".tmp"
+    # Save to Correction Queue
+    queue_path = os.path.join(CORRECTION_QUEUE, f"{vid_id}.json")
+    temp_path = queue_path + ".tmp"
     
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
-        os.rename(temp_path, final_path)
+        os.rename(temp_path, queue_path)
         
         # Update Manifest (Atomic)
         manifest_mgr.update_entry(vid_id, {
-            "filepath": final_path,
+            "sentry_status": "READY_FOR_CORRECTION",
+            "category": "TRANSCRIBED",
             "title": title,
-            "category": category,
-            "duration": video_duration,
-            "sentry_status": sentry_status
+            "duration": video_duration
         })
         
-        print(f" -> ✅ Done! {rtf_str} | Audit: {category}")
-        log_overall("SUCCESS", vid_id, f"{rtf_str} | {category}")
-        
-        # Emit training record (only for SUCCESS cats)
-        if category == "SUCCESS":
-            try:
-                training_export.emit_training_record(data, vid_id, channel_url, title, video_duration)
-            except Exception as te:
-                print(f"    [Training Export] Warning: {te}")
+        print(f" -> ✅ Transcribed! {rtf_str} | Sent to Correction Queue.")
+        log_overall("TRANSCRIBED", vid_id, f"{rtf_str}")
         return True
     except Exception as e:
-        print(f" -> ❌ Disk Error: {e}")
+        print(f" -> ❌ Queue Error: {e}")
         if os.path.exists(temp_path): os.remove(temp_path)
         log_overall("FAIL", vid_id, str(e))
         return False
@@ -381,8 +325,8 @@ def main():
         queue_ids = []
 
     mm = manifest_manager.ManifestManager()
-    downloaded_ids = mm.get_existing_ids()
-    print(f"  📂 Index Loaded: {len(downloaded_ids)} videos known.")
+    manifest = mm.get_manifest()
+    print(f"  📂 Index Loaded: {len(manifest)} videos known.")
     
     # Randomize the channel list so we don't pound one channel continuously (helps avoid YouTube temp limits)
     shuffled_channels = my_channels[:]
@@ -427,8 +371,11 @@ def main():
                 title = entry.get('title', 'Unknown Title')
                 url = entry.get('url', f"https://www.youtube.com/watch?v={vid_id}")
 
-                if vid_id in downloaded_ids:
-                    continue
+                entry_data = manifest.get(vid_id)
+                if entry_data:
+                    status = entry_data.get("category")
+                    if status in ["CAPTION_COMPLETE", "SUCCESS", "TRANSCRIBED"]:
+                        continue
                 
                 processed_count += 1
                 elapsed = time.time() - start_time
